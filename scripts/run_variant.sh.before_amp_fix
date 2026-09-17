@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CACHE="${1:?Usage: run_variant.sh CACHE OUT VARIANT}"
+OUT="${2:?Output directory required}"
+VARIANT="${3:?Variant required}"
+PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-20}"
+FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-30}"
+BATCH="${BATCH:-16}"
+WORKERS="${WORKERS:-4}"
+SEEDS="${SEEDS:-0 1 2}"
+FRACTIONS="${FRACTIONS:-0.1 1.0}"
+SIZE="${SIZE:-128}"
+WIDTH="${WIDTH:-96}"
+TRANSPORT=0
+AGE_AWARE=1
+TARGET=observed
+OBJECTIVE=jepa
+PRETRAIN=1
+EXTRA=()
+case "$VARIANT" in
+    scratch) PRETRAIN=0 ;;
+    scratch_transport) PRETRAIN=0; TRANSPORT=1 ;;
+    reconstruction) OBJECTIVE=reconstruction ;;
+    reconstruction_transport) OBJECTIVE=reconstruction; TRANSPORT=1 ;;
+    jepa_dense) TARGET=all ;;
+    jepa_observed) ;;
+    doppler_jepa) TRANSPORT=1 ;;
+    doppler_jepa_dense) TRANSPORT=1; TARGET=all ;;
+    no_doppler) TRANSPORT=1; EXTRA+=(--no-doppler) ;;
+    latest_only) TRANSPORT=1; EXTRA+=(--latest-only) ;;
+    synchronous_transport) TRANSPORT=1; AGE_AWARE=0 ;;
+    *) echo "Unknown variant: $VARIANT" >&2; exit 2 ;;
+esac
+for SEED in $SEEDS; do
+    BASE="$OUT/$VARIANT/seed_$SEED"
+    mkdir -p "$BASE"
+    COMMON=(--cache "$CACHE" --seed "$SEED" --transport "$TRANSPORT" --age-aware "$AGE_AWARE" --target-mask "$TARGET" --objective "$OBJECTIVE" --batch "$BATCH" --workers "$WORKERS" --size "$SIZE" --width "$WIDTH" --device cuda)
+    INIT=()
+    if [[ "$PRETRAIN" -eq 1 ]]; then
+        python -m doppler_jepa.train "${COMMON[@]}" "${EXTRA[@]}" --stage pretrain --out "$BASE/pretrain" --epochs "$PRETRAIN_EPOCHS"
+        INIT=(--init "$BASE/pretrain/last.pt")
+    fi
+    for FRACTION in $FRACTIONS; do
+        RUN="$BASE/fraction_$FRACTION"
+        python -m doppler_jepa.train "${COMMON[@]}" "${EXTRA[@]}" "${INIT[@]}" --stage finetune --out "$RUN" --fraction "$FRACTION" --epochs "$FINETUNE_EPOCHS"
+        CKPT="$RUN/best.pt"
+        python -m doppler_jepa.evaluate --cache "$CACHE" --checkpoint "$CKPT" --split dev --calibrate --out "$RUN/threshold_selection" --batch "$BATCH" --workers "$WORKERS" --device cuda
+        # Only development results are automated. Freeze the protocol before final test.
+        python -m doppler_jepa.evaluate --cache "$CACHE" --checkpoint "$CKPT" --split dev --calibration "$RUN/threshold_selection/threshold.json" --out "$RUN/dev_clean" --batch "$BATCH" --workers "$WORKERS" --device cuda
+        python -m doppler_jepa.evaluate --cache "$CACHE" --checkpoint "$CKPT" --split dev --calibration "$RUN/threshold_selection/threshold.json" --out "$RUN/dev_drop50" --corruption dropout --severity .5 --batch "$BATCH" --workers "$WORKERS" --device cuda
+    done
+done
